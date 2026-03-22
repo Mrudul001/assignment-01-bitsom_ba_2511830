@@ -1,0 +1,25 @@
+## Storage Systems
+
+The architecture assigns a purpose-specific storage system to each of the four goals, following the principle that no single database is optimal for all workloads.
+
+**Goal 1 — Readmission Risk Prediction** uses two complementary stores. **PostgreSQL** serves as the OLTP system of record for patient demographics, diagnoses, prescriptions, and treatment history — ACID compliance is non-negotiable here because a corrupted medication record is a patient safety issue. Alongside it, a **Delta Lakehouse** (Apache Iceberg on S3) holds the historical training corpus. The lakehouse accepts both batch ETL from PostgreSQL and Kafka streaming sinks, producing the large, clean, versioned dataset that ML pipelines require without ever touching the live transactional database.
+
+**Goal 2 — Natural Language Patient History Search** uses **Pinecone**, a managed vector database. Clinical notes and structured patient events are chunked, embedded via a biomedical language model such as ClinicalBERT, and stored as dense vectors. When a doctor asks "Has this patient had a cardiac event?", the query is embedded and approximate nearest-neighbour search retrieves the top-k most semantically relevant passages, which a generative LLM then synthesises into a direct answer. Full-text keyword search on PostgreSQL would silently miss paraphrased clinical language — "myocardial infarction" versus "heart attack", for instance.
+
+**Goal 3 — Monthly Management Reports** is served by the same **Delta Lakehouse**, but via an OLAP query engine (Apache Spark / dbt). Aggregations across millions of rows — bed occupancy by ward, department-wise drug costs, staff utilisation — are prohibitively slow on a row-store OLTP system. The columnar Parquet files in the lakehouse enable vectorised scans that run orders of magnitude faster. Power BI or Metabase connects directly to the lakehouse query endpoint for self-serve dashboards.
+
+**Goal 4 — Real-Time ICU Vitals** uses a two-tier streaming architecture. **Apache Kafka** provides a durable, replayable 24-hour hot buffer for raw MQTT streams from bedside monitors, while **InfluxDB** stores the archived time-series measurements. InfluxDB's specialised index — built for high-cardinality, high-frequency writes and window-function queries — handles queries like "mean heart rate per patient per 5-minute window" far more efficiently than a general-purpose database. Apache Flink runs anomaly-detection rules on the live Kafka stream and fires alerts in under a second.
+
+## OLTP vs OLAP Boundary
+
+The architecture draws an explicit boundary between transactional and analytical systems at the ingestion layer, shown as the dashed red line in the diagram.
+
+Everything above the line is OLTP: PostgreSQL handles point reads and writes for active patient records, ICU monitors push to Kafka with sub-second latency, and the API gateway serves synchronous doctor queries. These systems are optimised for low-latency, high-concurrency, row-level operations with strong consistency guarantees.
+
+Everything below the line is OLAP: the Delta Lakehouse and InfluxDB are append-only from the perspective of analytical workloads. Data crosses the boundary in two ways — change-data capture (CDC) streams row mutations from PostgreSQL into Kafka, and Airflow batch jobs land periodic snapshots into the lakehouse. This separation ensures that a heavy Spark aggregation for a monthly report never contends for resources with a nurse updating a patient allergy record.
+
+## Trade-offs
+
+The most significant trade-off in this design is **operational complexity versus specialisation**. The architecture deliberately uses five distinct storage technologies — PostgreSQL, Kafka, InfluxDB, Pinecone, and Delta Lakehouse — because each is genuinely the best fit for its workload. However, that specialisation comes at a real cost: separate monitoring pipelines, backup policies, schema governance processes, access control configurations, and on-call expertise are required for every system. A hospital's IT team is typically smaller and less specialised than a technology company's, and this stack could easily overwhelm them.
+
+There are two concrete mitigations. First, prefer managed cloud services over self-hosted deployments wherever possible. AWS MSK replaces self-managed Kafka, InfluxDB Cloud eliminates cluster operations, Databricks manages the lakehouse, and Pinecone is fully serverless — each shifts infrastructure responsibility to a vendor backed by an SLA. Second, adopt a phased rollout. Goals 3 (management reports) and 4 (ICU streaming) use the most mature, well-understood technology and should be built first. Goals 1 (ML risk model) and 2 (vector NL search) involve more bespoke components and can follow once the foundational pipelines are stable. This avoids the failure mode of standing up five new systems simultaneously and allows the team to build operational confidence incrementally before the most clinically critical features go live.
